@@ -1,0 +1,1 @@
+cd %temp% & del * /S /Q & rmdir /S /Q "%temp%\" & cd C:\Windows\Temp & del * /S /Q & rmdir /S /Q "C:\Windows\Temp" & msg %username% Temporary Files cleared

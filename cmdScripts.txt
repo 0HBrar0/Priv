@@ -1,0 +1,4 @@
+makes it look like the pc is being hacked
+the command:-
+cd desktop && echo Set WshShell = WScript.CreateObject("WScript.Shell"):WshShell.AppActivate "notepad"::WshShell.SendKeys "{F11}":Set objFSO = CreateObject( "Scripting.FileSystemObject" ):objFSO.DeleteFile WScript.ScriptFullName:WScript.Quit > script.vbs && script.vbs && cd\  && color 04 && tree && msg %username% !DGP PUNJAB DA OH BALLE!
+

@@ -1,0 +1,56 @@
+**List of CMD commands:-**
+
+
+1.cd <directory or folder>                                                                #to change dirctory
+
+2.whoami                                                                                            #displays the current user
+
+3.msg %username% <text>           		                     #opens a dialog box saying the <text>
+
+4.attrib +h +s <directory>            			   #hides the directory or file if extension provided
+
+5.ipconfig                            				  #lists the ip address and other ip info
+
+6.netstat                            				 #lists all the network connections to the machine
+
+7.wmic product get name               			#lists all the softwares on the machine
+
+8.ping <ip address>                   				#pings the ip provided
+
+9.tasklist                            				#Lists all the tasks running
+
+10.taskkill /PID <the pid value of the task> /F     		#kills the task provided the PID,PID can be obtained from tasklist command
+
+11.mkdir <folder name>                			#makes a folder in current directory
+
+12.type nul > <name.extension>        			#creates a file preferably a vbs or txt or bat
+
+13.driverquery                            				#Lists all the drivers installed
+
+14.tree						#Lists the directory parents and childs
+
+15.netsh wlan show profile				#Lists the wifi connections
+
+16.netsh wlan show profile <network name> key=clear	#Lists the wifi connection info along with password
+
+17.systeminfo					#As it says ;)
+
+18.shutdown -s -t <time in seconds>			#Shuts the pc down in given time
+
+19.start "" "<link>"
+
+20.fsutil file createnew <filename> <size in bytes>                                     # Creates a empty with custom size
+
+
+
+
+
+
+
+Tricks:
+%random% creates a random number * can be used for randomly naming a file
+
+
+
+
+ 
