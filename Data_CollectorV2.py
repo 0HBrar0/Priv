@@ -1,12 +1,10 @@
 import subprocess
 import platform
 import smtplib
-import webbrowser
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-webbrowser.open("https://youtu.be/edocx5HW8Hc?t=31")
 
 txt = open("mytxt.txt", "a")
 print("Check 1 Passed...:)")
