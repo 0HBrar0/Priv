@@ -26,7 +26,7 @@ infoX = str(info_alpha).replace(":", ";")
 
 mail_content = str(infoX)
 sender_address = 'alliswell7778869@gmail.com'
-sender_pass = 'sasorifeelnopain'
+sender_pass = 'passw'
 receiver_address = 'alliswell7778869@gmail.com'
 message = MIMEMultipart()
 message['From'] = sender_address
