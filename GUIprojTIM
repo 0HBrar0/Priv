@@ -1,0 +1,1622 @@
+import sys
+import os
+import time
+import pickle
+import collections
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from sklearn.metrics.pairwise import cosine_similarity
+import mediapipe as mp
+
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QHBoxLayout, QLabel, QPushButton, QFrame, QFileDialog,
+                               QListWidget, QListWidgetItem, QProgressBar, QTextEdit,
+                               QGridLayout, QGroupBox, QGraphicsDropShadowEffect,
+                               QMessageBox, QComboBox, QLineEdit, QDialog, 
+                               QDialogButtonBox, QStackedWidget, QScrollArea,
+                               QGraphicsOpacityEffect)
+from PySide6.QtCore import (Qt, QTimer, QPropertyAnimation, QRect, QEasingCurve, 
+                           QThread, Signal, QParallelAnimationGroup, QPoint, 
+                           QSequentialAnimationGroup, Property, QObject, QSize)
+from PySide6.QtGui import (QFont, QPalette, QColor, QPixmap, QPainter, QBrush,
+                           QLinearGradient, QRadialGradient, QPen, QIcon,
+                           QPainterPath, QFontDatabase, QCursor)
+
+# Import your backend modules
+from encrypt_utils import encrypt_file, decrypt_file, generate_and_store_key
+
+# ── Configuration ──
+DATASET_DIR = "dataset"
+EMBEDDINGS_FILE = "embeddings/face_embeddings.pkl"
+VAULT_ROOT = "vaults"
+SIMILARITY_THRESHOLD = 0.75
+GRACE_SEC = 10
+EAR_MIN = 0.18
+CLOSED_FRAMES = 3
+BLINKS_REQUIRED = 1
+WINDOW_SEC = 5
+FRAME_DOWNSAMPLE = 0.5
+
+# ── Models ──
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+mtcnn = MTCNN(image_size=160, margin=20, keep_all=False, post_process=True, device=device)
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+
+mp_mesh = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True,
+                                          min_detection_confidence=0.5, min_tracking_confidence=0.5)
+LEFT = [33, 160, 158, 133, 153, 144]
+RIGHT = [263, 387, 385, 362, 380, 373]
+
+
+def eye_aspect_ratio(pts):
+    v1 = np.linalg.norm(pts[1] - pts[5])
+    v2 = np.linalg.norm(pts[2] - pts[4])
+    h = np.linalg.norm(pts[0] - pts[3])
+    return (v1 + v2) / (2.0 * h)
+
+
+class AnimatedButton(QPushButton):
+    def __init__(self, text, icon="", parent=None):
+        super().__init__(text, parent)
+        self.icon_char = icon
+        self._animation_progress = 0
+        self.setMouseTracking(True)
+        
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        
+        if self.icon_char:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            
+            # Icon animation
+            font = QFont("Segoe UI Emoji", 16)
+            painter.setFont(font)
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            
+            icon_rect = QRect(15, self.rect().center().y() - 12, 24, 24)
+            painter.drawText(icon_rect, Qt.AlignCenter, self.icon_char)
+            
+    def enterEvent(self, event):
+        self.animate_hover(True)
+        super().enterEvent(event)
+        
+    def leaveEvent(self, event):
+        self.animate_hover(False)
+        super().leaveEvent(event)
+        
+    def animate_hover(self, hover):
+        effect = QGraphicsDropShadowEffect(self)
+        effect.setColor(QColor(0, 212, 255) if hover else QColor(0, 0, 0))
+        effect.setBlurRadius(20 if hover else 10)
+        effect.setOffset(0, 0)
+        self.setGraphicsEffect(effect)
+
+
+class CircularProgress(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.value = 0
+        self.max_value = 100
+        self.setFixedSize(200, 200)
+        self.color = QColor(0, 212, 255)
+        
+    def setValue(self, value):
+        self.value = value
+        self.update()
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Background circle
+        pen = QPen(QColor(50, 50, 70), 8)
+        painter.setPen(pen)
+        painter.drawEllipse(20, 20, 160, 160)
+        
+        # Progress arc
+        pen = QPen(self.color, 8)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        
+        angle = int(360 * (self.value / self.max_value))
+        painter.drawArc(20, 20, 160, 160, 90 * 16, -angle * 16)
+        
+        # Center text
+        painter.setPen(QPen(Qt.white))
+        font = QFont("Arial", 24, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(self.rect(), Qt.AlignCenter, f"{self.value}%")
+
+
+class ModernScannerWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(300, 300)
+        self.scanning = False
+        self.authenticated = False
+        self.scan_angle = 0
+        self.pulse_radius = 0
+        
+        # Animation timers
+        self.scan_timer = QTimer()
+        self.scan_timer.timeout.connect(self.update_scan)
+        self.scan_timer.start(50)
+        
+        self.pulse_timer = QTimer()
+        self.pulse_timer.timeout.connect(self.update_pulse)
+        self.pulse_timer.start(30)
+        
+    def update_scan(self):
+        if self.scanning:
+            self.scan_angle = (self.scan_angle + 5) % 360
+            self.update()
+            
+    def update_pulse(self):
+        if self.authenticated:
+            self.pulse_radius = (self.pulse_radius + 2) % 60
+            self.update()
+    
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        
+        center = self.rect().center()
+        
+        # Background gradient
+        gradient = QRadialGradient(center, 150)
+        gradient.setColorAt(0, QColor(20, 20, 40))
+        gradient.setColorAt(1, QColor(10, 10, 20))
+        painter.fillRect(self.rect(), gradient)
+        
+        # Outer ring
+        pen = QPen(QColor(100, 100, 120), 2)
+        painter.setPen(pen)
+        painter.drawEllipse(center.x() - 140, center.y() - 140, 280, 280)
+        
+        # Status-based effects
+        if self.authenticated:
+            # Success state
+            color = QColor(0, 255, 100)
+            
+            # Pulse effect
+            for i in range(3):
+                opacity = 255 - (self.pulse_radius + i * 20) * 4
+                if opacity > 0:
+                    pen = QPen(QColor(0, 255, 100, opacity), 2)
+                    painter.setPen(pen)
+                    radius = 100 + self.pulse_radius + i * 20
+                    painter.drawEllipse(center.x() - radius, center.y() - radius, 
+                                       radius * 2, radius * 2)
+            
+            # Check mark
+            pen = QPen(color, 6)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)  # No fill
+            path = QPainterPath()
+            path.moveTo(center.x() - 30, center.y())
+            path.lineTo(center.x() - 10, center.y() + 20)
+            path.lineTo(center.x() + 30, center.y() - 20)
+            painter.drawPath(path)
+            
+        elif self.scanning:
+            # Scanning state
+            color = QColor(0, 212, 255)
+            
+            # Rotating scanner line
+            painter.save()
+            painter.translate(center)
+            painter.rotate(self.scan_angle)
+            
+            gradient = QLinearGradient(0, 0, 100, 0)
+            gradient.setColorAt(0, QColor(0, 212, 255, 0))
+            gradient.setColorAt(1, color)
+            pen = QPen(gradient, 3)
+            painter.setPen(pen)
+            painter.drawLine(0, 0, 100, 0)
+            painter.restore()
+            
+            # Scanning rings
+            for i in range(3):
+                pen = QPen(QColor(0, 212, 255, 100 - i * 30), 2)
+                painter.setPen(pen)
+                painter.drawEllipse(center.x() - 80 - i * 20, center.y() - 80 - i * 20,
+                                   160 + i * 40, 160 + i * 40)
+        else:
+            # Idle state
+            color = QColor(150, 150, 170)
+            
+            # Face icon
+            pen = QPen(color, 3)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)  # Ensure no fill
+            
+            # Head
+            painter.drawEllipse(center.x() - 40, center.y() - 40, 80, 80)
+            
+            # Eyes
+            painter.drawEllipse(center.x() - 25, center.y() - 15, 10, 10)
+            painter.drawEllipse(center.x() + 15, center.y() - 15, 10, 10)
+            
+            # Mouth
+            path = QPainterPath()
+            path.moveTo(center.x() - 20, center.y() + 10)
+            path.quadTo(center.x(), center.y() + 20, center.x() + 20, center.y() + 10)
+            painter.drawPath(path)
+        
+        # Center dot (only if not authenticated)
+        if not self.authenticated:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(center.x() - 5, center.y() - 5, 10, 10)
+    
+    def set_scanning(self, scanning):
+        self.scanning = scanning
+        self.authenticated = False
+        self.update()
+        
+    def set_authenticated(self, authenticated):
+        self.authenticated = authenticated
+        self.scanning = False
+        self.pulse_radius = 0
+        self.update()
+
+
+class FileCard(QFrame):
+    removed = Signal()
+    
+    def __init__(self, file_path, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.setFixedHeight(80)
+        self.setMinimumWidth(500)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # Main card styling
+        self.setStyleSheet("""
+            FileCard {
+                background-color: rgba(30, 30, 50, 0.8);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 10px;
+            }
+        """)
+        
+        # Main horizontal layout
+        main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(15, 10, 15, 10)
+        main_layout.setSpacing(15)
+        self.setLayout(main_layout)
+        
+        # Icon container with background
+        icon_widget = QWidget()
+        icon_widget.setFixedSize(50, 50)
+        icon_widget.setStyleSheet("""
+            QWidget {
+                background-color: rgba(0, 212, 255, 0.15);
+                border-radius: 10px;
+            }
+        """)
+        icon_layout = QVBoxLayout(icon_widget)
+        icon_layout.setContentsMargins(0, 0, 0, 0)
+        
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignCenter)
+        icon_label.setStyleSheet("font-size: 24px; background: transparent;")
+        
+        # Set icon based on file type
+        if self.file_path.endswith('.enc'):
+            icon_label.setText("🔒")
+        elif self.file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+            icon_label.setText("🖼️")
+        elif self.file_path.lower().endswith(('.mp4', '.avi', '.mkv', '.mov')):
+            icon_label.setText("🎬")
+        elif self.file_path.lower().endswith(('.mp3', '.wav', '.flac', '.aac')):
+            icon_label.setText("🎵")
+        elif self.file_path.lower().endswith(('.doc', '.docx', '.txt', '.pdf')):
+            icon_label.setText("📄")
+        elif self.file_path.lower().endswith(('.zip', '.rar', '.7z', '.tar')):
+            icon_label.setText("📦")
+        else:
+            icon_label.setText("📎")
+            
+        icon_layout.addWidget(icon_label)
+        main_layout.addWidget(icon_widget)
+        
+        # Info container
+        info_container = QWidget()
+        info_container.setStyleSheet("background: transparent;")
+        info_layout = QVBoxLayout(info_container)
+        info_layout.setContentsMargins(0, 5, 0, 5)
+        info_layout.setSpacing(3)
+        
+        # File name
+        file_name = os.path.basename(self.file_path)
+        if len(file_name) > 40:
+            display_name = file_name[:37] + "..."
+        else:
+            display_name = file_name
+            
+        name_label = QLabel(display_name)
+        name_label.setStyleSheet("""
+            QLabel {
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: 600;
+                background: transparent;
+            }
+        """)
+        info_layout.addWidget(name_label)
+        
+        # File size and location
+        try:
+            file_size = os.path.getsize(self.file_path) / (1024 * 1024)
+            size_text = f"{file_size:.1f} MB"
+        except:
+            size_text = "Unknown size"
+            
+        # Location display
+        if VAULT_ROOT in self.file_path:
+            location = "Encrypted Vault"
+        else:
+            location = os.path.dirname(self.file_path)
+            if len(location) > 30:
+                location = "..." + location[-27:]
+                
+        details_label = QLabel(f"{size_text} • {location}")
+        details_label.setStyleSheet("""
+            QLabel {
+                color: rgba(255, 255, 255, 0.5);
+                font-size: 12px;
+                background: transparent;
+            }
+        """)
+        info_layout.addWidget(details_label)
+        
+        main_layout.addWidget(info_container, 1)
+        
+        # Remove button
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedSize(35, 35)
+        remove_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        remove_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255, 80, 80, 0.2);
+                border: 1px solid rgba(255, 80, 80, 0.4);
+                border-radius: 17px;
+                color: #ff6666;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 80, 80, 0.3);
+                border-color: rgba(255, 100, 100, 0.6);
+            }
+            QPushButton:pressed {
+                background-color: rgba(255, 80, 80, 0.4);
+            }
+        """)
+        remove_btn.clicked.connect(self.removed.emit)
+        main_layout.addWidget(remove_btn)
+        
+    def enterEvent(self, event):
+        self.setStyleSheet("""
+            FileCard {
+                background-color: rgba(40, 40, 60, 0.9);
+                border: 1px solid rgba(0, 212, 255, 0.4);
+                border-radius: 10px;
+            }
+        """)
+        
+    def leaveEvent(self, event):
+        self.setStyleSheet("""
+            FileCard {
+                background-color: rgba(30, 30, 50, 0.8);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 10px;
+            }
+        """)
+
+
+class ModernFileDropWidget(QScrollArea):
+    filesAdded = Signal(list)
+    
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setWidgetResizable(True)
+        
+        # Container widget
+        self.container = QWidget()
+        self.layout = QVBoxLayout(self.container)
+        self.layout.setSpacing(10)
+        self.layout.setContentsMargins(10, 10, 10, 10)
+        self.setWidget(self.container)
+        
+        # Styling with better visibility
+        self.setStyleSheet("""
+            QScrollArea {
+                background-color: rgba(0, 0, 0, 0.3);
+                border: 2px dashed rgba(0, 212, 255, 0.4);
+                border-radius: 15px;
+            }
+            QScrollBar:vertical {
+                background-color: rgba(255, 255, 255, 0.05);
+                border-radius: 5px;
+                width: 12px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: rgba(0, 212, 255, 0.6);
+                border-radius: 5px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: rgba(0, 212, 255, 0.8);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                border: none;
+                background: none;
+            }
+        """)
+        
+        self.add_placeholder()
+        
+    def add_placeholder(self):
+        placeholder_widget = QWidget()
+        placeholder_widget.setMinimumHeight(200)
+        placeholder_layout = QVBoxLayout(placeholder_widget)
+        
+        # Icon
+        icon_label = QLabel("📂")
+        icon_label.setAlignment(Qt.AlignCenter)
+        icon_label.setStyleSheet("font-size: 48px; color: rgba(0, 212, 255, 0.5);")
+        
+        # Text
+        text_label = QLabel("Drop files here or click 'Add Files'")
+        text_label.setAlignment(Qt.AlignCenter)
+        text_label.setStyleSheet("""
+            QLabel {
+                color: rgba(255, 255, 255, 0.5);
+                font-size: 18px;
+                font-weight: 500;
+                padding: 10px;
+            }
+        """)
+        
+        info_label = QLabel("Supported: All file types • Drag multiple files")
+        info_label.setAlignment(Qt.AlignCenter)
+        info_label.setStyleSheet("""
+            QLabel {
+                color: rgba(255, 255, 255, 0.3);
+                font-size: 14px;
+                padding: 5px;
+            }
+        """)
+        
+        placeholder_layout.addStretch()
+        placeholder_layout.addWidget(icon_label)
+        placeholder_layout.addWidget(text_label)
+        placeholder_layout.addWidget(info_label)
+        placeholder_layout.addStretch()
+        
+        self.layout.addWidget(placeholder_widget)
+        
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+            self.setStyleSheet(self.styleSheet().replace("0.4)", "0.8)").replace("0.3)", "0.5)"))
+        else:
+            event.ignore()
+            
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet(self.styleSheet().replace("0.8)", "0.4)").replace("0.5)", "0.3)"))
+        
+    def dropEvent(self, event):
+        files = [u.toLocalFile() for u in event.mimeData().urls()]
+        valid_files = [f for f in files if os.path.isfile(f)]
+        if valid_files:
+            self.add_files(valid_files)
+            self.filesAdded.emit(valid_files)
+        self.setStyleSheet(self.styleSheet().replace("0.8)", "0.4)").replace("0.5)", "0.3)"))
+        
+    def add_files(self, file_paths):
+        # Remove placeholder if exists
+        if self.layout.count() == 1:
+            item = self.layout.itemAt(0)
+            if item and isinstance(item.widget(), QWidget):
+                widget = item.widget()
+                # Check if it's the placeholder by looking for the icon label
+                if widget.findChild(QLabel) and "Drop files here" in widget.findChild(QLabel).text():
+                    widget.deleteLater()
+                
+        for file_path in file_paths:
+            if not self.file_already_added(file_path):
+                card = FileCard(file_path)
+                card.removed.connect(lambda fp=file_path, c=card: self.remove_file(c))
+                self.layout.addWidget(card)
+    
+    def file_already_added(self, file_path):
+        """Check if file is already in the list"""
+        for i in range(self.layout.count()):
+            widget = self.layout.itemAt(i).widget()
+            if isinstance(widget, FileCard) and widget.file_path == file_path:
+                return True
+        return False
+            
+    def remove_file(self, card):
+        card.deleteLater()
+        
+        # Add placeholder back if empty
+        if self.layout.count() == 0:
+            self.add_placeholder()
+            
+    def get_all_files(self):
+        files = []
+        for i in range(self.layout.count()):
+            widget = self.layout.itemAt(i).widget()
+            if isinstance(widget, FileCard):
+                files.append(widget.file_path)
+        return files
+        
+    def clear_files(self):
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.add_placeholder()
+
+
+class EnrollmentDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("User Enrollment")
+        self.setFixedSize(500, 300)
+        self.setModal(True)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1a1a2e;
+                border-radius: 15px;
+            }
+            QLabel {
+                color: white;
+                font-size: 14px;
+            }
+            QLineEdit {
+                background-color: rgba(255, 255, 255, 0.1);
+                border: 2px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 10px;
+                color: white;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #00d4ff;
+            }
+            QComboBox {
+                background-color: rgba(255, 255, 255, 0.1);
+                border: 2px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 8px;
+                color: white;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid white;
+                margin-right: 5px;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(20)
+        layout.setContentsMargins(30, 30, 30, 30)
+        
+        # Title
+        title = QLabel("Create New Biometric Profile")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #00d4ff;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Instructions
+        instructions = QLabel("Enter your name to create a secure biometric profile:")
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("color: #888;")
+        layout.addWidget(instructions)
+        
+        # Name input
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Enter your name...")
+        layout.addWidget(self.name_input)
+        
+        # Capture mode
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("Capture mode:")
+        mode_layout.addWidget(mode_label)
+        
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Auto capture (recommended)", "Manual capture"])
+        mode_layout.addWidget(self.mode_combo, 1)
+        layout.addLayout(mode_layout)
+        
+        layout.addStretch()
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        cancel_btn = AnimatedButton("Cancel")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 10px 30px;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.2);
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        
+        ok_btn = AnimatedButton("Start Enrollment")
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00d4ff, stop:1 #0099cc);
+                border: none;
+                border-radius: 8px;
+                padding: 10px 30px;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00e5ff, stop:1 #00aadd);
+            }
+        """)
+        ok_btn.clicked.connect(self.accept)
+        
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+        
+    def get_enrollment_data(self):
+        if self.exec() == QDialog.Accepted:
+            name = self.name_input.text().strip().lower()
+            mode = "auto" if self.mode_combo.currentIndex() == 0 else "manual"
+            return name, mode
+        return None, None
+
+
+# Keep the same thread classes from original code
+class BiometricAuthThread(QThread):
+    authenticationResult = Signal(str)
+    statusUpdate = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+
+    def run(self):
+        self.running = True
+        try:
+            if not os.path.exists(EMBEDDINGS_FILE):
+                self.statusUpdate.emit("No enrolled users found")
+                self.authenticationResult.emit("")
+                return
+
+            with open(EMBEDDINGS_FILE, "rb") as f:
+                embeddings, names = pickle.load(f)
+
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                self.statusUpdate.emit("Cannot access webcam")
+                self.authenticationResult.emit("")
+                return
+
+            blink_times = collections.deque()
+            frames_closed = 0
+            self.statusUpdate.emit("Look at camera and blink naturally...")
+
+            while self.running:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                frame_small = cv2.resize(frame, None, fx=FRAME_DOWNSAMPLE, fy=FRAME_DOWNSAMPLE)
+                h_sm, w_sm = frame_small.shape[:2]
+
+                live, frames_closed = self.detect_liveness(frame_small, h_sm, w_sm, blink_times, frames_closed)
+
+                if live:
+                    self.statusUpdate.emit("Liveness detected! Recognizing...")
+                    img_pil = Image.fromarray(cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB))
+                    faces = mtcnn(img_pil)
+
+                    if faces is not None:
+                        with torch.no_grad():
+                            emb = resnet(faces.unsqueeze(0).to(device)).squeeze().cpu().numpy()
+                        sims = cosine_similarity([emb], embeddings)[0]
+                        idx, score = np.argmax(sims), sims[np.argmax(sims)]
+
+                        if score >= SIMILARITY_THRESHOLD:
+                            user = names[idx]
+                            self.statusUpdate.emit(f"Welcome back, {user}!")
+                            cap.release()
+                            self.authenticationResult.emit(user)
+                            return
+                        else:
+                            self.statusUpdate.emit("Face not recognized")
+
+            cap.release()
+            self.authenticationResult.emit("")
+
+        except Exception as e:
+            self.statusUpdate.emit(f"Error: {str(e)}")
+            self.authenticationResult.emit("")
+
+    def detect_liveness(self, frame_small, h_sm, w_sm, blink_times, frames_closed):
+        res = mp_mesh.process(cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB))
+        if not res.multi_face_landmarks:
+            blink_times.clear()
+            return False, 0
+
+        lm = res.multi_face_landmarks[0].landmark
+        pts_l = np.array([[lm[i].x * w_sm, lm[i].y * h_sm] for i in LEFT])
+        pts_r = np.array([[lm[i].x * w_sm, lm[i].y * h_sm] for i in RIGHT])
+        ear = (eye_aspect_ratio(pts_l) + eye_aspect_ratio(pts_r)) / 2
+
+        if ear < EAR_MIN:
+            frames_closed += 1
+        else:
+            if frames_closed >= CLOSED_FRAMES:
+                now = time.time()
+                blink_times.append(now)
+                while blink_times and now - blink_times[0] > WINDOW_SEC:
+                    blink_times.popleft()
+                if len(blink_times) >= BLINKS_REQUIRED:
+                    blink_times.clear()
+                    return True, 0
+            frames_closed = 0
+        return False, frames_closed
+
+    def stop(self):
+        self.running = False
+
+
+class EnrollmentThread(QThread):
+    enrollmentComplete = Signal(bool, str)
+    progressUpdate = Signal(int)
+
+    def __init__(self, username, mode):
+        super().__init__()
+        self.username = username
+        self.mode = mode
+
+    def run(self):
+        try:
+            person_dir = os.path.join(DATASET_DIR, self.username)
+            os.makedirs(person_dir, exist_ok=True)
+
+            success = self.capture_images()
+            if not success:
+                self.enrollmentComplete.emit(False, "Image capture failed")
+                return
+
+            self.progressUpdate.emit(70)
+
+            self.extract_embeddings()
+            self.progressUpdate.emit(90)
+
+            generate_and_store_key(self.username)
+            vault_dir = os.path.join(VAULT_ROOT, self.username)
+            os.makedirs(vault_dir, exist_ok=True)
+
+            self.progressUpdate.emit(100)
+            self.enrollmentComplete.emit(True, f"Successfully enrolled {self.username}")
+
+        except Exception as e:
+            self.enrollmentComplete.emit(False, f"Enrollment failed: {str(e)}")
+
+    def capture_images(self):
+        NUM_IMAGES = 10
+        CAPTURE_DELAY = 2
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            return False
+
+        count = 0
+        while count < NUM_IMAGES:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            cv2.imshow(f"Enrollment - Image {count + 1}/{NUM_IMAGES}", frame)
+            cv2.waitKey(1)
+
+            path = os.path.join(DATASET_DIR, self.username, f"{count + 1}.jpg")
+            cv2.imwrite(path, frame)
+            count += 1
+
+            progress = int((count / NUM_IMAGES) * 60)
+            self.progressUpdate.emit(progress)
+
+            if self.mode == "auto":
+                time.sleep(CAPTURE_DELAY)
+
+        cap.release()
+        cv2.destroyAllWindows()
+        return True
+
+    def extract_embeddings(self):
+        embeddings = []
+        names = []
+
+        if os.path.exists(EMBEDDINGS_FILE):
+            with open(EMBEDDINGS_FILE, "rb") as f:
+                embeddings, names = pickle.load(f)
+
+        person_path = os.path.join(DATASET_DIR, self.username)
+        for img_file in os.listdir(person_path):
+            img_path = os.path.join(person_path, img_file)
+            try:
+                img = Image.open(img_path)
+                face = mtcnn(img)
+                if face is None:
+                    continue
+                with torch.no_grad():
+                    emb = resnet(face.unsqueeze(0)).squeeze().numpy()
+                embeddings.append(emb)
+                names.append(self.username)
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+
+        os.makedirs(os.path.dirname(EMBEDDINGS_FILE), exist_ok=True)
+        with open(EMBEDDINGS_FILE, "wb") as f:
+            pickle.dump((embeddings, names), f)
+
+
+class FileEncryptionThread(QThread):
+    encryptionComplete = Signal(bool, str)
+    progressUpdate = Signal(int)
+
+    def __init__(self, files, username, operation):
+        super().__init__()
+        self.files = files
+        self.username = username
+        self.operation = operation
+
+    def run(self):
+        try:
+            vault_dir = os.path.join(VAULT_ROOT, self.username)
+            os.makedirs(vault_dir, exist_ok=True)
+
+            total_files = len(self.files)
+            for i, file_path in enumerate(self.files):
+                if self.operation == "encrypt":
+                    output_path = os.path.join(vault_dir, os.path.basename(file_path) + ".enc")
+                    encrypt_file(file_path, output_path, self.username)
+                else:
+                    output_path = file_path[:-4]
+                    decrypt_file(file_path, output_path, self.username)
+
+                progress = int(((i + 1) / total_files) * 100)
+                self.progressUpdate.emit(progress)
+
+            self.encryptionComplete.emit(True, f"{self.operation.capitalize()}ion completed successfully")
+
+        except Exception as e:
+            self.encryptionComplete.emit(False, f"{self.operation.capitalize()}ion failed: {str(e)}")
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SecureBio - Biometric File Encryption")
+        self.setGeometry(100, 100, 1400, 900)
+        
+        self.authenticated_user = None
+        self.auth_thread = None
+        
+        self.setup_ui()
+        self.setup_styling()
+        self.apply_animations()
+        
+    def setup_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Main layout
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Header with gradient background
+        header_widget = QWidget()
+        header_widget.setFixedHeight(150)
+        header_widget.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #1a1a2e, stop:0.5 #16213e, stop:1 #0f3460);
+                border-bottom: 2px solid rgba(0, 212, 255, 0.3);
+            }
+        """)
+        
+        header_layout = QVBoxLayout(header_widget)
+        header_layout.setContentsMargins(50, 20, 50, 20)
+        
+        # App title with modern typography
+        title_layout = QHBoxLayout()
+        
+        logo_label = QLabel("🔐")
+        logo_label.setStyleSheet("font-size: 48px;")
+        title_layout.addWidget(logo_label)
+        
+        title_text_layout = QVBoxLayout()
+        title = QLabel("SecureBio")
+        title.setStyleSheet("""
+            font-size: 42px;
+            font-weight: bold;
+            color: #00d4ff;
+            letter-spacing: 2px;
+        """)
+        
+        subtitle = QLabel("Advanced Biometric File Encryption System")
+        subtitle.setStyleSheet("""
+            font-size: 16px;
+            color: rgba(255, 255, 255, 0.7);
+            letter-spacing: 1px;
+        """)
+        
+        title_text_layout.addWidget(title)
+        title_text_layout.addWidget(subtitle)
+        title_layout.addLayout(title_text_layout)
+        
+        title_layout.addStretch()
+        
+        # Status badge
+        self.status_badge = QFrame()
+        self.status_badge.setFixedSize(250, 50)
+        self.status_badge.setStyleSheet("""
+            QFrame {
+                background-color: rgba(255, 100, 100, 0.2);
+                border: 2px solid rgba(255, 100, 100, 0.5);
+                border-radius: 25px;
+            }
+        """)
+        
+        status_layout = QHBoxLayout(self.status_badge)
+        
+        self.status_icon = QLabel("🔒")
+        self.status_icon.setStyleSheet("font-size: 20px;")
+        
+        self.status_text = QLabel("System Locked")
+        self.status_text.setStyleSheet("""
+            color: #ff6666;
+            font-weight: bold;
+            font-size: 14px;
+        """)
+        
+        status_layout.addWidget(self.status_icon)
+        status_layout.addWidget(self.status_text)
+        
+        title_layout.addWidget(self.status_badge)
+        
+        header_layout.addLayout(title_layout)
+        main_layout.addWidget(header_widget)
+        
+        # Content area
+        content_widget = QWidget()
+        content_widget.setStyleSheet("""
+            QWidget {
+                background-color: #0f0f23;
+            }
+        """)
+        
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setSpacing(30)
+        content_layout.setContentsMargins(50, 30, 50, 30)
+        
+        # Left panel - Biometric Authentication
+        left_panel = QFrame()
+        left_panel.setStyleSheet("""
+            QFrame {
+                background-color: rgba(255, 255, 255, 0.02);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 20px;
+            }
+        """)
+        
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(20)
+        left_layout.setContentsMargins(30, 30, 30, 30)
+        
+        # Section title
+        bio_title = QLabel("Biometric Authentication")
+        bio_title.setStyleSheet("""
+            font-size: 24px;
+            font-weight: bold;
+            color: #00d4ff;
+            margin-bottom: 10px;
+        """)
+        left_layout.addWidget(bio_title)
+        
+        # Scanner widget
+        self.scanner = ModernScannerWidget()
+        left_layout.addWidget(self.scanner, alignment=Qt.AlignCenter)
+        
+        # Status message
+        self.auth_status = QLabel("Ready for authentication")
+        self.auth_status.setAlignment(Qt.AlignCenter)
+        self.auth_status.setStyleSheet("""
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 14px;
+            padding: 10px;
+            background-color: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+        """)
+        left_layout.addWidget(self.auth_status)
+        
+        # Authentication buttons
+        auth_btn_layout = QVBoxLayout()
+        auth_btn_layout.setSpacing(15)
+        
+        self.auth_btn = AnimatedButton("  Authenticate", "👤")
+        self.auth_btn.setFixedHeight(50)
+        self.auth_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00d4ff, stop:1 #0099cc);
+                border: none;
+                border-radius: 25px;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                text-align: center;
+                padding-left: 40px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00e5ff, stop:1 #00aadd);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #0099cc, stop:1 #007799);
+            }
+        """)
+        self.auth_btn.clicked.connect(self.start_authentication)
+        
+        self.enroll_btn = AnimatedButton("  New User", "➕")
+        self.enroll_btn.setFixedHeight(50)
+        self.enroll_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.1);
+                border: 2px solid rgba(255, 255, 255, 0.2);
+                border-radius: 25px;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                text-align: center;
+                padding-left: 40px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.15);
+                border: 2px solid rgba(0, 212, 255, 0.5);
+            }
+        """)
+        self.enroll_btn.clicked.connect(self.start_enrollment)
+        
+        self.logout_btn = AnimatedButton("  Logout", "🚪")
+        self.logout_btn.setFixedHeight(50)
+        self.logout_btn.setVisible(False)  # Hidden initially
+        self.logout_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff6b6b, stop:1 #ee5a24);
+                border: none;
+                border-radius: 25px;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                text-align: center;
+                padding-left: 40px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff7c7c, stop:1 #ff6b35);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ee5a24, stop:1 #dd4914);
+            }
+        """)
+        self.logout_btn.clicked.connect(self.logout)
+        
+        auth_btn_layout.addWidget(self.auth_btn)
+        auth_btn_layout.addWidget(self.enroll_btn)
+        auth_btn_layout.addWidget(self.logout_btn)
+        
+        left_layout.addLayout(auth_btn_layout)
+        left_layout.addStretch()
+        
+        # Right panel - File Operations
+        right_panel = QFrame()
+        right_panel.setStyleSheet("""
+            QFrame {
+                background-color: rgba(255, 255, 255, 0.02);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 20px;
+            }
+        """)
+        
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setSpacing(20)
+        right_layout.setContentsMargins(30, 30, 30, 30)
+        
+        # Section title
+        file_title = QLabel("File Operations")
+        file_title.setStyleSheet("""
+            font-size: 24px;
+            font-weight: bold;
+            color: #00d4ff;
+            margin-bottom: 10px;
+        """)
+        right_layout.addWidget(file_title)
+        
+        # File drop area
+        self.file_drop = ModernFileDropWidget()
+        self.file_drop.setMinimumHeight(400)
+        right_layout.addWidget(self.file_drop)
+        
+        # File operation buttons
+        file_btn_layout = QHBoxLayout()
+        file_btn_layout.setSpacing(15)
+        
+        self.add_files_btn = AnimatedButton("Add Files", "📁")
+        self.add_files_btn.setEnabled(False)
+        self.add_files_btn.clicked.connect(self.add_files)
+        
+        self.add_encrypted_btn = AnimatedButton("Add Encrypted", "🔐")
+        self.add_encrypted_btn.setEnabled(False)
+        self.add_encrypted_btn.clicked.connect(self.add_encrypted_files)
+        
+        self.clear_btn = AnimatedButton("Clear All", "🗑️")
+        self.clear_btn.clicked.connect(self.file_drop.clear_files)
+        
+        for btn in [self.add_files_btn, self.add_encrypted_btn, self.clear_btn]:
+            btn.setFixedHeight(45)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(255, 255, 255, 0.05);
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    border-radius: 10px;
+                    color: white;
+                    font-weight: bold;
+                    padding: 0 20px;
+                }
+                QPushButton:hover:enabled {
+                    background-color: rgba(255, 255, 255, 0.1);
+                    border: 1px solid rgba(0, 212, 255, 0.3);
+                }
+                QPushButton:disabled {
+                    color: rgba(255, 255, 255, 0.3);
+                }
+            """)
+            file_btn_layout.addWidget(btn)
+        
+        right_layout.addLayout(file_btn_layout)
+        
+        # Progress indicator
+        self.progress_widget = QWidget()
+        self.progress_widget.setVisible(False)
+        progress_layout = QVBoxLayout(self.progress_widget)
+        
+        self.progress_label = QLabel("Processing...")
+        self.progress_label.setAlignment(Qt.AlignCenter)
+        self.progress_label.setStyleSheet("color: white; font-size: 14px;")
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: rgba(255, 255, 255, 0.1);
+                border: none;
+                border-radius: 10px;
+                height: 20px;
+                text-align: center;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00d4ff, stop:1 #00ff88);
+                border-radius: 10px;
+            }
+        """)
+        
+        progress_layout.addWidget(self.progress_label)
+        progress_layout.addWidget(self.progress_bar)
+        right_layout.addWidget(self.progress_widget)
+        
+        # Action buttons
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(20)
+        
+        self.encrypt_btn = AnimatedButton("  Encrypt Files", "🔒")
+        self.encrypt_btn.setEnabled(False)
+        self.encrypt_btn.setFixedHeight(60)
+        self.encrypt_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00ff88, stop:1 #00cc66);
+                border: none;
+                border-radius: 30px;
+                color: white;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover:enabled {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00ff99, stop:1 #00dd77);
+            }
+            QPushButton:disabled {
+                background: rgba(255, 255, 255, 0.1);
+                color: rgba(255, 255, 255, 0.3);
+            }
+        """)
+        self.encrypt_btn.clicked.connect(self.encrypt_files)
+        
+        self.decrypt_btn = AnimatedButton("  Decrypt Files", "🔓")
+        self.decrypt_btn.setEnabled(False)
+        self.decrypt_btn.setFixedHeight(60)
+        self.decrypt_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff6b6b, stop:1 #ee5a24);
+                border: none;
+                border-radius: 30px;
+                color: white;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover:enabled {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff7c7c, stop:1 #ff6b35);
+            }
+            QPushButton:disabled {
+                background: rgba(255, 255, 255, 0.1);
+                color: rgba(255, 255, 255, 0.3);
+            }
+        """)
+        self.decrypt_btn.clicked.connect(self.decrypt_files)
+        
+        action_layout.addWidget(self.encrypt_btn)
+        action_layout.addWidget(self.decrypt_btn)
+        
+        right_layout.addStretch()
+        right_layout.addLayout(action_layout)
+        
+        # Add panels to content
+        content_layout.addWidget(left_panel, 1)
+        content_layout.addWidget(right_panel, 2)
+        
+        main_layout.addWidget(content_widget)
+        
+    def setup_styling(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #0f0f23;
+            }
+            QMessageBox {
+                background-color: #1a1a2e;
+                color: white;
+            }
+            QMessageBox QPushButton {
+                background-color: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 5px;
+                padding: 5px 15px;
+                color: white;
+                min-width: 60px;
+            }
+            QMessageBox QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.2);
+            }
+        """)
+        
+    def apply_animations(self):
+        # Fade in animation for main window
+        self.setWindowOpacity(0)
+        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_animation.setDuration(500)
+        self.fade_animation.setStartValue(0)
+        self.fade_animation.setEndValue(1)
+        self.fade_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.fade_animation.start()
+        
+    def update_status(self, authenticated=False, username=""):
+        if authenticated:
+            self.status_badge.setStyleSheet("""
+                QFrame {
+                    background-color: rgba(0, 255, 100, 0.2);
+                    border: 2px solid rgba(0, 255, 100, 0.5);
+                    border-radius: 25px;
+                }
+            """)
+            self.status_icon.setText("🔓")
+            self.status_text.setText(f"Authenticated: {username}")
+            self.status_text.setStyleSheet("""
+                color: #00ff88;
+                font-weight: bold;
+                font-size: 14px;
+            """)
+        else:
+            self.status_badge.setStyleSheet("""
+                QFrame {
+                    background-color: rgba(255, 100, 100, 0.2);
+                    border: 2px solid rgba(255, 100, 100, 0.5);
+                    border-radius: 25px;
+                }
+            """)
+            self.status_icon.setText("🔒")
+            self.status_text.setText("System Locked")
+            self.status_text.setStyleSheet("""
+                color: #ff6666;
+                font-weight: bold;
+                font-size: 14px;
+            """)
+            
+    def start_authentication(self):
+        if not os.path.exists(EMBEDDINGS_FILE):
+            QMessageBox.warning(self, "No Users", 
+                              "No enrolled users found. Please enroll a user first.")
+            return
+            
+        self.auth_btn.setEnabled(False)
+        self.scanner.set_scanning(True)
+        self.auth_status.setText("Initializing camera...")
+        
+        self.auth_thread = BiometricAuthThread()
+        self.auth_thread.authenticationResult.connect(self.on_authentication_result)
+        self.auth_thread.statusUpdate.connect(lambda msg: self.auth_status.setText(msg))
+        self.auth_thread.start()
+        
+    def on_authentication_result(self, username):
+        self.auth_btn.setEnabled(True)
+        self.scanner.set_scanning(False)
+        
+        if username:
+            self.authenticated_user = username
+            self.scanner.set_authenticated(True)
+            self.update_status(True, username)
+            self.auth_status.setText(f"Welcome back, {username}!")
+            
+            # Enable file operations
+            self.add_files_btn.setEnabled(True)
+            self.add_encrypted_btn.setEnabled(True)
+            self.encrypt_btn.setEnabled(True)
+            self.decrypt_btn.setEnabled(True)
+            
+            # Show logout button, hide auth button
+            self.logout_btn.setVisible(True)
+            self.auth_btn.setVisible(False)
+            
+            # Success animation
+            self.celebrate_authentication()
+        else:
+            self.auth_status.setText("Authentication failed. Please try again.")
+            
+    def logout(self):
+        """Handle user logout"""
+        reply = QMessageBox.question(self, "Confirm Logout",
+                                   f"Are you sure you want to logout?",
+                                   QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            # Reset authentication state
+            self.authenticated_user = None
+            self.scanner.set_authenticated(False)
+            self.update_status(False)
+            self.auth_status.setText("Logged out successfully")
+            
+            # Disable file operations
+            self.add_files_btn.setEnabled(False)
+            self.add_encrypted_btn.setEnabled(False)
+            self.encrypt_btn.setEnabled(False)
+            self.decrypt_btn.setEnabled(False)
+            
+            # Clear any files in the drop area
+            self.file_drop.clear_files()
+            
+            # Show auth button, hide logout button
+            self.auth_btn.setVisible(True)
+            self.logout_btn.setVisible(False)
+            
+            # Reset auth status after a delay
+            QTimer.singleShot(2000, lambda: self.auth_status.setText("Ready for authentication"))
+            
+    def celebrate_authentication(self):
+        # Quick flash animation for success
+        effect = QGraphicsOpacityEffect()
+        self.scanner.setGraphicsEffect(effect)
+        
+        self.flash_animation = QPropertyAnimation(effect, b"opacity")
+        self.flash_animation.setDuration(300)
+        self.flash_animation.setKeyValueAt(0, 1)
+        self.flash_animation.setKeyValueAt(0.5, 0.3)
+        self.flash_animation.setKeyValueAt(1, 1)
+        self.flash_animation.start()
+        
+    def start_enrollment(self):
+        dialog = EnrollmentDialog(self)
+        username, mode = dialog.get_enrollment_data()
+        
+        if not username:
+            return
+            
+        if os.path.exists(os.path.join(DATASET_DIR, username)):
+            reply = QMessageBox.question(self, "User Exists",
+                                       f"User '{username}' already exists. Re-enroll?",
+                                       QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+                
+        self.progress_widget.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Starting enrollment...")
+        
+        self.enroll_thread = EnrollmentThread(username, mode)
+        self.enroll_thread.enrollmentComplete.connect(self.on_enrollment_complete)
+        self.enroll_thread.progressUpdate.connect(self.update_enrollment_progress)
+        self.enroll_thread.start()
+        
+    def update_enrollment_progress(self, value):
+        self.progress_bar.setValue(value)
+        if value < 60:
+            self.progress_label.setText("Capturing biometric data...")
+        elif value < 90:
+            self.progress_label.setText("Processing face embeddings...")
+        else:
+            self.progress_label.setText("Finalizing enrollment...")
+            
+    def on_enrollment_complete(self, success, message):
+        self.progress_widget.setVisible(False)
+        
+        if success:
+            QMessageBox.information(self, "Success", message)
+        else:
+            QMessageBox.critical(self, "Error", message)
+            
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Files to Encrypt", "", "All Files (*)")
+        if files:
+            self.file_drop.add_files(files)
+            
+    def add_encrypted_files(self):
+        if not self.authenticated_user:
+            return
+            
+        vault_dir = os.path.join(VAULT_ROOT, self.authenticated_user)
+        if not os.path.exists(vault_dir):
+            QMessageBox.information(self, "Empty Vault", 
+                                  "No encrypted files found in your vault.")
+            return
+            
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Encrypted Files", vault_dir, "Encrypted Files (*.enc)")
+        if files:
+            self.file_drop.add_files(files)
+            
+    def encrypt_files(self):
+        if not self.authenticated_user:
+            QMessageBox.warning(self, "Authentication Required",
+                              "Please authenticate first.")
+            return
+            
+        files = self.file_drop.get_all_files()
+        plain_files = [f for f in files if not f.endswith('.enc')]
+        
+        if not plain_files:
+            QMessageBox.information(self, "No Files", 
+                                  "Please add files to encrypt.")
+            return
+            
+        self.progress_widget.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Encrypting files...")
+        
+        self.encrypt_thread = FileEncryptionThread(plain_files, self.authenticated_user, "encrypt")
+        self.encrypt_thread.encryptionComplete.connect(self.on_operation_complete)
+        self.encrypt_thread.progressUpdate.connect(self.progress_bar.setValue)
+        self.encrypt_thread.start()
+        
+    def decrypt_files(self):
+        if not self.authenticated_user:
+            QMessageBox.warning(self, "Authentication Required",
+                              "Please authenticate first.")
+            return
+            
+        files = self.file_drop.get_all_files()
+        encrypted_files = [f for f in files if f.endswith('.enc')]
+        
+        if not encrypted_files:
+            QMessageBox.information(self, "No Encrypted Files",
+                                  "Please add encrypted files to decrypt.")
+            return
+            
+        self.progress_widget.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Decrypting files...")
+        
+        self.decrypt_thread = FileEncryptionThread(encrypted_files, self.authenticated_user, "decrypt")
+        self.decrypt_thread.encryptionComplete.connect(self.on_operation_complete)
+        self.decrypt_thread.progressUpdate.connect(self.progress_bar.setValue)
+        self.decrypt_thread.start()
+        
+    def on_operation_complete(self, success, message):
+        self.progress_widget.setVisible(False)
+        
+        if success:
+            QMessageBox.information(self, "Success", message)
+            self.file_drop.clear_files()
+        else:
+            QMessageBox.critical(self, "Error", message)
+            
+    def closeEvent(self, event):
+        if hasattr(self, 'auth_thread') and self.auth_thread and self.auth_thread.isRunning():
+            self.auth_thread.stop()
+            self.auth_thread.wait()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    
+    # Set fusion style for modern look
+    app.setStyle('Fusion')
+    
+    # Dark color palette
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(15, 15, 35))
+    palette.setColor(QPalette.WindowText, Qt.white)
+    palette.setColor(QPalette.Base, QColor(25, 25, 25))
+    palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+    palette.setColor(QPalette.ToolTipBase, Qt.black)
+    palette.setColor(QPalette.ToolTipText, Qt.white)
+    palette.setColor(QPalette.Text, Qt.white)
+    palette.setColor(QPalette.Button, QColor(53, 53, 53))
+    palette.setColor(QPalette.ButtonText, Qt.white)
+    palette.setColor(QPalette.BrightText, Qt.red)
+    palette.setColor(QPalette.Link, QColor(42, 130, 218))
+    palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.HighlightedText, Qt.black)
+    app.setPalette(palette)
+    
+    # Create required directories
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    os.makedirs(VAULT_ROOT, exist_ok=True)
+    os.makedirs(os.path.dirname(EMBEDDINGS_FILE), exist_ok=True)
+    
+    window = MainWindow()
+    window.show()
+    
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
